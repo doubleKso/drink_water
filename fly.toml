@@ -1,0 +1,24 @@
+# fly.toml app configuration file for drink-water
+
+app = "drink-water"
+primary_region = "sin"
+
+[build]
+
+[env]
+  PORT = "3000"
+  DATA_DIR = "/data"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  # Keep the scheduler and Telegram long polling alive when there is no web traffic.
+  min_machines_running = 1
+  processes = ["app"]
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
