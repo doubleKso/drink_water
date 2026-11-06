@@ -78,6 +78,14 @@ const ALMOST_DONE = [
   'ပန်းတိုင်မျဉ်းနား ရောက်နေပြီ—ရေလေးထပ်သောက်လိုက်ပါ 🏁',
 ];
 
+const FOLLOW_UPS = [
+  'အလုပ်များနေတာ သိပါတယ်နော်—ရေတစ်ငုံလောက်တော့ သောက်ပေးပါဦး 🫶',
+  'မနှောင့်ယှက်တော့ဘူးနော်၊ ဒီတစ်ခါလေးပဲ ရေသောက်ဖို့ ထပ်သတိပေးတာပါ 💧',
+  'ရေဘူးလေး အနားမှာရှိရင် အခုတစ်ငုံလောက် သောက်လိုက်ပါနော် 🌿',
+  'ခဏလေးနားပြီး ရေသောက်လိုက်ရင် ပိုလန်းသွားမယ်နော် ✨',
+  'ဒီ reminder လေးပြီးရင် ထပ်မနှောင့်ယှက်သေးဘူးနော်—ရေလေးသောက်ပါဦး 💙',
+];
+
 function pick(list, random) {
   return list[Math.floor(random() * list.length)];
 }
@@ -92,6 +100,8 @@ export function buildReminder({
   count,
   goal,
   isFirstOfDay = false,
+  isFollowUp = false,
+  customMessages = [],
   minutes = 12 * 60,
   random = Math.random,
 }) {
@@ -99,7 +109,12 @@ export function buildReminder({
   const totalMl = ml ?? count ?? 0;
   const goalMl = targetMl ?? goal ?? 0;
   let text;
-  if (goalMl - totalMl <= 500 && totalMl > 0) text = pick(ALMOST_DONE, random);
+  const usableCustomMessages = Array.isArray(customMessages)
+    ? customMessages.filter((message) => typeof message === 'string' && message.trim())
+    : [];
+  if (isFollowUp) text = pick(FOLLOW_UPS, random);
+  else if (usableCustomMessages.length && random() < 0.35) text = pick(usableCustomMessages, random);
+  else if (goalMl - totalMl <= 500 && totalMl > 0) text = pick(ALMOST_DONE, random);
   else if (isFirstOfDay && minutes < 11 * 60) {
     text = pick(MORNING, random).replace('{goal}', `${goalMl.toLocaleString('en-US')} ml`);
   }
@@ -108,7 +123,7 @@ export function buildReminder({
   else text = pick(REMINDERS, random);
 
   return {
-    title: TITLE,
+    title: isFollowUp ? '💙 ရေလေး မမေ့နဲ့နော်' : TITLE,
     body: `${text}\n(ယနေ့ ${totalMl.toLocaleString('en-US')}/${goalMl.toLocaleString('en-US')} ml)`,
   };
 }

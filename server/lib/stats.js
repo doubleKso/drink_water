@@ -30,6 +30,20 @@ export function buildState(device, now = new Date()) {
     week.push({ date, ml: totalForDate(device, date), count: (device.log[date] || []).length });
   }
 
+  const [year, monthNumber] = today.split('-').map(Number);
+  const monthLength = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+  const month = [];
+  for (let day = 1; day <= monthLength; day++) {
+    const date = `${year}-${String(monthNumber).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const ml = totalForDate(device, date);
+    month.push({
+      date,
+      ml,
+      count: (device.log[date] || []).length,
+      done: ml >= goalMl,
+    });
+  }
+
   // streak = consecutive days at or above goal. Today only counts once it is reached,
   // but an unfinished today does not break the streak yet.
   let streak = 0;
@@ -39,8 +53,11 @@ export function buildState(device, now = new Date()) {
     cursor = shiftDate(cursor, -1);
   }
 
-  const lastDrinkAt = todayEntries.length ? timestampOf(todayEntries[todayEntries.length - 1]) : null;
+  const lastDrinkAt = todayEntries.length
+    ? Math.max(...todayEntries.map(timestampOf))
+    : null;
   const telegram = device.telegram || {};
+  const weekTotalMl = week.reduce((sum, day) => sum + day.ml, 0);
 
   return {
     settings: device.settings,
@@ -50,6 +67,15 @@ export function buildState(device, now = new Date()) {
     goalMl,
     streak,
     week,
+    weekSummary: {
+      totalMl: weekTotalMl,
+      averageMl: Math.round(weekTotalMl / 7),
+      completedDays: week.filter((day) => day.ml >= goalMl).length,
+    },
+    month,
+    todayLog: [...todayEntries]
+      .sort((a, b) => timestampOf(b) - timestampOf(a))
+      .map((entry) => ({ at: timestampOf(entry), ml: amountOf(entry, device.settings.cupSizeMl) })),
     lastDrinkAt,
     subscribed: Boolean(device.subscription),
     telegram: {
@@ -63,9 +89,10 @@ export function buildState(device, now = new Date()) {
 export function lastDrinkTimestamp(device) {
   let latest = 0;
   for (const list of Object.values(device.log)) {
-    if (!list.length) continue;
-    const timestamp = timestampOf(list[list.length - 1]);
-    if (timestamp > latest) latest = timestamp;
+    for (const entry of list) {
+      const timestamp = timestampOf(entry);
+      if (timestamp > latest) latest = timestamp;
+    }
   }
   return latest;
 }

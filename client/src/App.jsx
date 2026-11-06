@@ -2,15 +2,20 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from './api.js';
 import {
   deviceTimeZone,
+  clearReminderNotifications,
   disablePush,
   enablePush,
   notificationPermission,
   syncSubscription,
+  updateAppBadge,
 } from './push.js';
+import { flushDrinkQueue, newDrinkEvent, queueDrink } from './offlineQueue.js';
 import Glass from './components/Glass.jsx';
 import WeekChart from './components/WeekChart.jsx';
 import NotifyCard from './components/NotifyCard.jsx';
 import SettingsSheet from './components/SettingsSheet.jsx';
+import CareGarden from './components/CareGarden.jsx';
+import MonthCalendar from './components/MonthCalendar.jsx';
 
 function clock(timestamp, tz) {
   return new Intl.DateTimeFormat('en-GB', {
@@ -37,9 +42,48 @@ function prettyDate(dateKey) {
 
 const CONFETTI = ['🎉', '💧', '✨', '💙', '🥳'];
 const CUP_SIZES = [150, 250, 350, 500];
+const DRINK_TIMES = [0, 10, 30, 60];
+const STATE_CACHE_KEY = 'water-reminder-last-state';
 
 function formatMl(value) {
   return `${Number(value).toLocaleString('en-US')} ml`;
+}
+
+function dateKeyAt(timestamp, tz) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    year: 'numeric', month: '2-digit', day: '2-digit', timeZone: tz,
+  }).formatToParts(timestamp).reduce((all, part) => ({ ...all, [part.type]: part.value }), {});
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function addOptimisticDrink(current, event) {
+  const date = dateKeyAt(event.occurredAt, current.settings.tz);
+  if (date !== current.today) return current;
+  const before = current.totalMl;
+  const totalMl = before + event.amountMl;
+  const newlyDone = before < current.goalMl && totalMl >= current.goalMl;
+  const week = current.week.map((day) => day.date === date
+    ? { ...day, ml: day.ml + event.amountMl, count: day.count + 1 }
+    : day);
+  const month = current.month.map((day) => day.date === date
+    ? { ...day, ml: day.ml + event.amountMl, count: day.count + 1, done: totalMl >= current.goalMl }
+    : day);
+  const weekTotalMl = current.weekSummary.totalMl + event.amountMl;
+  return {
+    ...current,
+    totalMl,
+    count: current.count + 1,
+    lastDrinkAt: Math.max(current.lastDrinkAt || 0, event.occurredAt),
+    todayLog: [{ at: event.occurredAt, ml: event.amountMl }, ...current.todayLog],
+    week,
+    month,
+    streak: current.streak + (newlyDone ? 1 : 0),
+    weekSummary: {
+      totalMl: weekTotalMl,
+      averageMl: Math.round(weekTotalMl / 7),
+      completedDays: current.weekSummary.completedDays + (newlyDone ? 1 : 0),
+    },
+  };
 }
 
 export default function App() {
@@ -51,6 +95,8 @@ export default function App() {
   const [celebrate, setCelebrate] = useState(false);
   const [permission, setPermission] = useState(notificationPermission());
   const [selectedMl, setSelectedMl] = useState(null);
+  const [drinkMinutesAgo, setDrinkMinutesAgo] = useState(0);
+  const [offlineQueued, setOfflineQueued] = useState(false);
   const startupSyncDone = useRef(false);
   const toastTimer = useRef();
 
@@ -65,6 +111,16 @@ export default function App() {
       setState(await api.state());
       setLoadError(false);
     } catch {
+      try {
+        const cached = JSON.parse(localStorage.getItem(STATE_CACHE_KEY));
+        if (cached?.settings && cached?.today) {
+          setState(cached);
+          setLoadError(false);
+          return;
+        }
+      } catch {
+        // A broken or missing snapshot simply falls through to the retry screen.
+      }
       setLoadError(true);
     }
   }, []);
@@ -89,6 +145,24 @@ export default function App() {
     };
   }, [refresh]);
 
+  useEffect(() => {
+    const syncOffline = async () => {
+      try {
+        const next = await flushDrinkQueue();
+        if (next) {
+          setState(next);
+          setOfflineQueued(false);
+          say('Offline မှတ်တမ်းတွေ sync ပြီးပါပြီ ✓');
+        }
+      } catch {
+        // Keep the queue for the next online event.
+      }
+    };
+    window.addEventListener('online', syncOffline);
+    if (navigator.onLine) syncOffline();
+    return () => window.removeEventListener('online', syncOffline);
+  }, [say]);
+
   // once per app start: keep the timezone current and re-register the push subscription
   // (phones sometimes rotate subscriptions silently; this heals that)
   useEffect(() => {
@@ -112,6 +186,16 @@ export default function App() {
     if (state && selectedMl === null) setSelectedMl(state.settings.cupSizeMl);
   }, [state, selectedMl]);
 
+  useEffect(() => {
+    if (!state) return;
+    try {
+      localStorage.setItem(STATE_CACHE_KEY, JSON.stringify(state));
+    } catch {
+      // Storage can be disabled; live state still works normally.
+    }
+    updateAppBadge(state.totalMl, state.goalMl, state.settings.cupSizeMl).catch?.(() => undefined);
+  }, [state]);
+
   async function run(action, failMessage) {
     if (busy) return;
     setBusy(true);
@@ -126,15 +210,30 @@ export default function App() {
 
   const onDrink = () =>
     run(async () => {
+      const amountMl = selectedMl || state.settings.cupSizeMl;
+      const occurredAt = Date.now() - drinkMinutesAgo * 60_000;
+      const event = newDrinkEvent(amountMl, occurredAt);
       const before = state.totalMl;
-      const next = await api.drink(selectedMl || state.settings.cupSizeMl);
-      setState(next);
+      let next;
+      try {
+        next = await api.drink(amountMl, occurredAt, event.eventId);
+        setState(next);
+      } catch (error) {
+        if (error.status) throw error;
+        await queueDrink(event);
+        setState((current) => addOptimisticDrink(current, event));
+        setOfflineQueued(true);
+        say('Offline မှာ သိမ်းထားပါတယ်—လိုင်းရတာနဲ့ ပို့ပေးမယ် ✓');
+        next = addOptimisticDrink(state, event);
+      }
+      setDrinkMinutesAgo(0);
+      clearReminderNotifications().catch?.(() => undefined);
       navigator.vibrate?.(25);
       if (before < next.goalMl && next.totalMl >= next.goalMl) {
         setCelebrate(true);
         setTimeout(() => setCelebrate(false), 4500);
       }
-    }, 'မှတ်လို့မရဘူး၊ အင်တာနက် စစ်ကြည့်ပါ');
+    }, 'မှတ်လို့မရသေးဘူး၊ ပြန်စမ်းကြည့်ပါ');
 
   const onUndo = () => run(async () => setState(await api.undo()), 'ပြန်ဖျက်လို့မရဘူး');
 
@@ -239,6 +338,7 @@ export default function App() {
           <span className="chip">
             {lastDrinkAt ? `⏱ ${clock(lastDrinkAt, settings.tz)} · ${count} ကြိမ်` : '⏱ ဒီနေ့ မသောက်ရသေးဘူး'}
           </span>
+          {offlineQueued && <span className="chip offline">☁︎ Sync စောင့်နေတယ်</span>}
         </div>
 
         <div className="cup-picker" role="radiogroup" aria-label="ခွက်အရွယ်အစား ရွေးမယ်">
@@ -258,8 +358,23 @@ export default function App() {
           ))}
         </div>
 
+        <div className="drink-time-picker" role="radiogroup" aria-label="ရေသောက်ခဲ့တဲ့အချိန်">
+          {DRINK_TIMES.map((minutes) => (
+            <button
+              type="button"
+              role="radio"
+              aria-checked={drinkMinutesAgo === minutes}
+              className={drinkMinutesAgo === minutes ? 'selected' : ''}
+              key={minutes}
+              onClick={() => setDrinkMinutesAgo(minutes)}
+            >
+              {minutes === 0 ? 'အခု' : `${minutes} မိနစ်က`}
+            </button>
+          ))}
+        </div>
+
         <button className="drink-btn" onClick={onDrink} disabled={busy}>
-          + {selectedMl || settings.cupSizeMl} ml မှတ်မယ်
+          + {selectedMl || settings.cupSizeMl} ml {drinkMinutesAgo ? 'နောက်ပြန်မှတ်မယ်' : 'မှတ်မယ်'}
         </button>
         {count > 0 && (
           <button className="link" onClick={onUndo} disabled={busy}>
@@ -267,6 +382,8 @@ export default function App() {
           </button>
         )}
       </section>
+
+      <CareGarden totalMl={totalMl} goalMl={goalMl} streak={streak} />
 
       <NotifyCard
         state={state}
@@ -287,6 +404,8 @@ export default function App() {
         </div>
         <WeekChart week={week} goalMl={goalMl} today={today} />
       </section>
+
+      <MonthCalendar days={state.month} today={today} summary={state.weekSummary} />
 
       {showSettings && (
         <SettingsSheet
@@ -316,7 +435,11 @@ export default function App() {
               {CONFETTI[i % CONFETTI.length]}
             </span>
           ))}
-          <div className="celebrate-msg">ဒီနေ့ ပန်းတိုင် ပြည့်သွားပြီ! 🎉</div>
+          <div className="celebrate-msg">
+            <span className="celebrate-plant">🌻</span>
+            <b>ဒီနေ့ ပန်းတိုင် ပြည့်သွားပြီ!</b>
+            <small>ကိုယ့်ကိုယ်ကို ဂရုစိုက်နိုင်တာ အရမ်းတော်တယ် 💙</small>
+          </div>
         </div>
       )}
 

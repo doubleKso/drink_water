@@ -7,7 +7,11 @@ const CUP_SIZES = [150, 250, 350, 500];
 const HM = /^([01]\d|2[0-3]):[0-5]\d$/;
 
 function validTimes(value) {
-  return HM.test(value.start) && HM.test(value.end) && value.start < value.end;
+  const mainWindow = HM.test(value.start) && HM.test(value.end) && value.start < value.end;
+  const breakWindow = !value.breakEnabled || (
+    HM.test(value.breakStart) && HM.test(value.breakEnd) && value.breakStart < value.breakEnd
+  );
+  return mainWindow && breakWindow;
 }
 
 function TelegramConnection({
@@ -63,6 +67,7 @@ export default function SettingsSheet({
   const [form, setForm] = useState({ ...settings });
   const [saveStatus, setSaveStatus] = useState('idle');
   const [closing, setClosing] = useState(false);
+  const [newMessage, setNewMessage] = useState('');
   const latestForm = useRef(form);
   const saveTimer = useRef(null);
   const saveQueue = useRef(Promise.resolve());
@@ -227,7 +232,7 @@ export default function SettingsSheet({
               <input type="time" value={form.end} onChange={(event) => set({ end: event.target.value })} required />
             </label>
           </div>
-          {!timesOk && <p className="error">စချိန်က ပြီးချိန်ထက် စောရပါမယ်</p>}
+          {!timesOk && <p className="error">စချိန်နဲ့ နားချိန်တွေကို အစော–အနောက် မှန်အောင် ပြင်ပေးပါ</p>}
 
           <label className="field">
             <span>သတိပေးမယ့် အချိန်ခြား</span>
@@ -248,6 +253,71 @@ export default function SettingsSheet({
                 type="checkbox"
                 checked={form.skipWeekends}
                 onChange={(event) => set({ skipWeekends: event.target.checked })}
+              />
+              <span />
+            </span>
+          </label>
+
+          <label className="setting-line">
+            <span>
+              <b>ထမင်းစားချိန် အနားပေးမယ်</b>
+              <small>ဒီအချိန်အတွင်း reminder မပို့ပါ</small>
+            </span>
+            <span className="toggle">
+              <input
+                type="checkbox"
+                checked={form.breakEnabled}
+                onChange={(event) => set({ breakEnabled: event.target.checked })}
+              />
+              <span />
+            </span>
+          </label>
+          {form.breakEnabled && (
+            <div className="field-row nested-fields">
+              <label className="field">
+                <span>နားချိန်စ</span>
+                <input type="time" value={form.breakStart} onChange={(event) => set({ breakStart: event.target.value })} />
+              </label>
+              <label className="field">
+                <span>ပြန်စမယ့်အချိန်</span>
+                <input type="time" value={form.breakEnd} onChange={(event) => set({ breakEnd: event.target.value })} />
+              </label>
+            </div>
+          )}
+
+          <label className="setting-line">
+            <span>
+              <b>တစ်ခါပဲ ထပ်သတိပေးမယ်</b>
+              <small>မသောက်သေးရင် {form.followUpMin} မိနစ်အကြာ ပေါ့ပေါ့လေး ထပ်ပို့မယ်</small>
+            </span>
+            <span className="toggle">
+              <input
+                type="checkbox"
+                checked={form.followUpEnabled}
+                onChange={(event) => set({ followUpEnabled: event.target.checked })}
+              />
+              <span />
+            </span>
+          </label>
+          {form.followUpEnabled && (
+            <label className="field compact-field">
+              <span>ထပ်သတိပေးမယ့်အချိန်</span>
+              <select value={form.followUpMin} onChange={(event) => set({ followUpMin: Number(event.target.value) })}>
+                {[10, 15, 20, 30].map((minutes) => <option key={minutes} value={minutes}>{minutes} မိနစ်အကြာ</option>)}
+              </select>
+            </label>
+          )}
+
+          <label className="setting-line">
+            <span>
+              <b>အချိန်နဲ့အညီ ညှိပေးမယ်</b>
+              <small>ညနေပိုင်း နောက်ကျနေရင် ပိုစော၊ ရှေ့ရောက်နေရင် ပိုကျဲမယ်</small>
+            </span>
+            <span className="toggle">
+              <input
+                type="checkbox"
+                checked={form.adaptiveEnabled}
+                onChange={(event) => set({ adaptiveEnabled: event.target.checked })}
               />
               <span />
             </span>
@@ -308,6 +378,77 @@ export default function SettingsSheet({
               <span />
             </span>
           </label>
+          <label className="setting-line nested consent-line">
+            <span>
+              <b>မမှတ်ရသေးရင် ဂရုစိုက်စာပို့မယ်</b>
+              <small>သူ့သဘောတူညီချက်နဲ့သာ ဖွင့်ပါ</small>
+            </span>
+            <span className="toggle">
+              <input
+                type="checkbox"
+                checked={telegram.owner.connected && form.telegramNoDrinkAlertEnabled}
+                onChange={(event) => set({ telegramNoDrinkAlertEnabled: event.target.checked })}
+                disabled={!telegram.owner.connected}
+              />
+              <span />
+            </span>
+          </label>
+          {telegram.owner.connected && form.telegramNoDrinkAlertEnabled && (
+            <label className="field owner-alert-time">
+              <span>ဒီအချိန်ထိ မမှတ်ရသေးရင် ပို့မယ်</span>
+              <input
+                type="time"
+                value={form.ownerNoDrinkAlertTime}
+                onChange={(event) => set({ ownerNoDrinkAlertTime: event.target.value })}
+              />
+            </label>
+          )}
+        </section>
+
+        <section className="settings-section custom-message-section">
+          <div>
+            <span className="eyebrow">YOUR WORDS</span>
+            <h3>ကိုယ်ပိုင်စာလေးတွေ</h3>
+            <p className="section-help">ထည့်ထားတဲ့စာတွေကို reminder တွေနဲ့ ရောပြီး ပို့ပေးမယ်။</p>
+          </div>
+          {(form.customMessages || []).map((message, index) => (
+            <div className="custom-message" key={index}>
+              <input
+                aria-label={`ကိုယ်ပိုင်စာ ${index + 1}`}
+                maxLength="120"
+                value={message}
+                onChange={(event) => {
+                  const messages = [...form.customMessages];
+                  messages[index] = event.target.value;
+                  set({ customMessages: messages });
+                }}
+              />
+              <button
+                type="button"
+                aria-label="စာဖျက်မယ်"
+                onClick={() => set({ customMessages: form.customMessages.filter((_, itemIndex) => itemIndex !== index) })}
+              >×</button>
+            </div>
+          ))}
+          {form.customMessages.length < 20 && (
+            <div className="add-message">
+              <input
+                maxLength="120"
+                value={newMessage}
+                placeholder="ဥပမာ — ဒီနေ့ အစည်းအဝေးကောင်းပါစေ 💙"
+                onChange={(event) => setNewMessage(event.target.value)}
+              />
+              <button
+                type="button"
+                disabled={!newMessage.trim()}
+                onClick={() => {
+                  if (!newMessage.trim()) return;
+                  set({ customMessages: [...form.customMessages, newMessage.trim()] });
+                  setNewMessage('');
+                }}
+              >ထည့်မယ်</button>
+            </div>
+          )}
         </section>
 
         <div className="sheet-actions">

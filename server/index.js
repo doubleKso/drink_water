@@ -57,16 +57,40 @@ function sanitizeSettings(input = {}, current = DEFAULT_SETTINGS) {
   }
   const interval = Number(input.intervalMin);
   if (Number.isInteger(interval) && interval >= 15 && interval <= 240) next.intervalMin = interval;
+  if (typeof input.followUpEnabled === 'boolean') next.followUpEnabled = input.followUpEnabled;
+  const followUpMin = Number(input.followUpMin);
+  if (Number.isInteger(followUpMin) && followUpMin >= 5 && followUpMin <= 60) {
+    next.followUpMin = followUpMin;
+  }
+  if (typeof input.adaptiveEnabled === 'boolean') next.adaptiveEnabled = input.adaptiveEnabled;
   const goalMl = Number(input.goalMl);
   if (Number.isInteger(goalMl) && goalMl >= 250 && goalMl <= 10_000) next.goalMl = goalMl;
   const cupSizeMl = Number(input.cupSizeMl);
   if (Number.isInteger(cupSizeMl) && cupSizeMl >= 50 && cupSizeMl <= 2000) next.cupSizeMl = cupSizeMl;
   if (typeof input.skipWeekends === 'boolean') next.skipWeekends = input.skipWeekends;
+  if (typeof input.breakEnabled === 'boolean') next.breakEnabled = input.breakEnabled;
+  if (isHM(input.breakStart)) next.breakStart = input.breakStart;
+  if (isHM(input.breakEnd)) next.breakEnd = input.breakEnd;
+  if (parseHM(next.breakStart) >= parseHM(next.breakEnd)) {
+    next.breakStart = current.breakStart;
+    next.breakEnd = current.breakEnd;
+  }
   if (typeof input.telegramReminderEnabled === 'boolean') {
     next.telegramReminderEnabled = input.telegramReminderEnabled;
   }
   if (typeof input.telegramGoalAlertEnabled === 'boolean') {
     next.telegramGoalAlertEnabled = input.telegramGoalAlertEnabled;
+  }
+  if (typeof input.telegramNoDrinkAlertEnabled === 'boolean') {
+    next.telegramNoDrinkAlertEnabled = input.telegramNoDrinkAlertEnabled;
+  }
+  if (isHM(input.ownerNoDrinkAlertTime)) next.ownerNoDrinkAlertTime = input.ownerNoDrinkAlertTime;
+  if (Array.isArray(input.customMessages)) {
+    next.customMessages = input.customMessages
+      .filter((message) => typeof message === 'string')
+      .map((message) => message.trim().slice(0, 120))
+      .filter(Boolean)
+      .slice(0, 20);
   }
   if (isValidTimeZone(input.tz)) next.tz = input.tz;
   return next;
@@ -126,16 +150,28 @@ app.post(
 app.post(
   '/api/drink/:id',
   withDevice(async (req, res, device) => {
-    const { date } = localParts(new Date(), device.settings.tz);
+    const now = Date.now();
+    const requestedAt = Number(req.body?.occurredAt);
+    const occurredAt = Number.isFinite(requestedAt) &&
+      requestedAt <= now + 60_000 &&
+      requestedAt >= now - 36 * 60 * 60_000
+      ? requestedAt
+      : now;
+    const { date } = localParts(new Date(occurredAt), device.settings.tz);
     const requestedMl = Number(req.body?.amountMl);
     const amountMl = Number.isInteger(requestedMl) && requestedMl >= 50 && requestedMl <= 2000
       ? requestedMl
       : device.settings.cupSizeMl;
+    const eventId = typeof req.body?.eventId === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(req.body.eventId)
+      ? req.body.eventId
+      : null;
     const beforeMl = totalForDate(device, date);
-    recordDrink(device, date, amountMl);
-    const afterMl = beforeMl + amountMl;
+    const recorded = recordDrink(device, date, amountMl, occurredAt, eventId);
+    const afterMl = totalForDate(device, date);
 
-    const alert = await maybeSendGoalAlert(device, { date, beforeMl, afterMl });
+    const alert = recorded
+      ? await maybeSendGoalAlert(device, { date, beforeMl, afterMl })
+      : { sent: false };
     if (alert.error) {
       console.warn(`[telegram] goal alert failed for ${device.id.slice(0, 8)}:`, alert.error?.message);
     }

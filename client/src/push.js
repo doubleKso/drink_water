@@ -22,6 +22,24 @@ export function registerServiceWorker() {
   });
 }
 
+async function messageWorker(message) {
+  if (!('serviceWorker' in navigator)) return;
+  const registration = await navigator.serviceWorker.ready;
+  (navigator.serviceWorker.controller || registration.active)?.postMessage(message);
+}
+
+export function clearReminderNotifications() {
+  return messageWorker({ type: 'clear-reminders' });
+}
+
+export function updateAppBadge(totalMl, goalMl, cupSizeMl) {
+  const remaining = Math.max(0, Math.ceil((goalMl - totalMl) / cupSizeMl));
+  if ('setAppBadge' in navigator) {
+    return remaining > 0 ? navigator.setAppBadge(remaining) : navigator.clearAppBadge();
+  }
+  return messageWorker({ type: 'set-badge', count: remaining });
+}
+
 function urlBase64ToUint8Array(base64) {
   const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
   const raw = atob(padded.replace(/-/g, '+').replace(/_/g, '/'));

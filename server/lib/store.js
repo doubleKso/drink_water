@@ -21,7 +21,7 @@ export const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data')
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const MAX_DEVICES = Number(process.env.MAX_DEVICES || 50);
 const KEEP_DAYS = 90;
-const SETTINGS_VERSION = 2;
+const SETTINGS_VERSION = 3;
 
 export const DEFAULT_SETTINGS = Object.freeze({
   version: SETTINGS_VERSION,
@@ -30,11 +30,20 @@ export const DEFAULT_SETTINGS = Object.freeze({
   start: '06:00',
   end: '22:00',
   intervalMin: 30,
+  followUpEnabled: true,
+  followUpMin: 15,
+  adaptiveEnabled: true,
   goalMl: 2000,
   cupSizeMl: 250,
   skipWeekends: true,
+  breakEnabled: true,
+  breakStart: '12:00',
+  breakEnd: '13:00',
   telegramReminderEnabled: true,
   telegramGoalAlertEnabled: true,
+  telegramNoDrinkAlertEnabled: false,
+  ownerNoDrinkAlertTime: '18:00',
+  customMessages: [],
   tz: 'Asia/Yangon',
 });
 
@@ -78,7 +87,14 @@ function normalizeDevice(device) {
     : Number.isInteger(legacyGoal) && legacyGoal > 0
       ? legacyGoal * cupSizeMl
       : DEFAULT_SETTINGS.goalMl;
-  const settings = { ...DEFAULT_SETTINGS, ...current, cupSizeMl, goalMl };
+  const customMessages = Array.isArray(current.customMessages)
+    ? current.customMessages
+      .filter((message) => typeof message === 'string')
+      .map((message) => message.trim().slice(0, 120))
+      .filter(Boolean)
+      .slice(0, 20)
+    : [];
+  const settings = { ...DEFAULT_SETTINGS, ...current, cupSizeMl, goalMl, customMessages };
   if ('goal' in settings) delete settings.goal;
   if (JSON.stringify(settings) !== JSON.stringify(current)) changed = true;
   device.settings = settings;
@@ -105,7 +121,11 @@ function normalizeDevice(device) {
         Number.isInteger(entry.ml) &&
         entry.ml > 0
       ) {
-        return [{ at: entry.at, ml: entry.ml }];
+        return [{
+          at: entry.at,
+          ml: entry.ml,
+          ...(typeof entry.id === 'string' && entry.id.length <= 80 ? { id: entry.id } : {}),
+        }];
       }
       changed = true;
       return [];
@@ -128,6 +148,18 @@ function normalizeDevice(device) {
   }
   if (!device.goalAlerts || typeof device.goalAlerts !== 'object') {
     device.goalAlerts = {};
+    changed = true;
+  }
+  if (!device.noDrinkAlerts || typeof device.noDrinkAlerts !== 'object') {
+    device.noDrinkAlerts = {};
+    changed = true;
+  }
+  if (!Number.isFinite(device.followUpSentFor)) {
+    device.followUpSentFor = 0;
+    changed = true;
+  }
+  if (!Number.isFinite(device.followUpEligibleFor)) {
+    device.followUpEligibleFor = 0;
     changed = true;
   }
   return changed;
@@ -168,9 +200,12 @@ export function ensureDevice(id) {
     subscription: null,
     settings: { ...DEFAULT_SETTINGS },
     lastSentAt: 0,
+    followUpSentFor: 0,
+    followUpEligibleFor: 0,
     log: {},
     telegram: { reminder: null, owner: null, pendingLinks: {} },
     goalAlerts: {},
+    noDrinkAlerts: {},
   };
   db.devices[id] = device;
   save();
@@ -184,16 +219,34 @@ export function allDevices() {
   });
 }
 
-export function recordDrink(device, dateKey, amountMl = device.settings.cupSizeMl, ts = Date.now()) {
-  (device.log[dateKey] ||= []).push({ at: ts, ml: amountMl });
+export function recordDrink(
+  device,
+  dateKey,
+  amountMl = device.settings.cupSizeMl,
+  ts = Date.now(),
+  eventId = null,
+) {
+  if (
+    eventId &&
+    Object.values(device.log).some((entries) => entries.some((entry) => entry?.id === eventId))
+  ) {
+    return false;
+  }
+  (device.log[dateKey] ||= []).push({
+    at: ts,
+    ml: amountMl,
+    ...(eventId ? { id: eventId } : {}),
+  });
   // prune old days so the file stays tiny
   const keys = Object.keys(device.log).sort();
   while (keys.length > KEEP_DAYS) {
     const oldDate = keys.shift();
     delete device.log[oldDate];
     delete device.goalAlerts[oldDate];
+    delete device.noDrinkAlerts[oldDate];
   }
   save();
+  return true;
 }
 
 /** Removes the most recent drink of the given day. Returns true if something was removed. */

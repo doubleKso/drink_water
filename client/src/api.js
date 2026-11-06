@@ -20,7 +20,7 @@ const me = () => getDeviceId();
 export const api = {
   vapidKey: () => request('GET', '/vapid-public-key'),
   state: () => request('GET', `/state/${me()}`),
-  drink: (amountMl) => request('POST', `/drink/${me()}`, { amountMl }),
+  drink: (amountMl, occurredAt, eventId) => request('POST', `/drink/${me()}`, { amountMl, occurredAt, eventId }),
   undo: () => request('POST', `/undo/${me()}`),
   saveSettings: (settings) => request('PUT', `/settings/${me()}`, settings),
   subscribe: (subscription, settings) => request('POST', `/subscribe/${me()}`, { subscription, settings }),

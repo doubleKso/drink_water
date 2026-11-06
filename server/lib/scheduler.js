@@ -4,6 +4,7 @@ import { lastDrinkTimestamp, totalForDate } from './stats.js';
 import { buildReminder } from './messages.js';
 import { sendPush } from './push.js';
 import { sendTelegram, telegramConfigured } from './telegram.js';
+import { maybeSendNoDrinkAlert } from './no-drink-alert.js';
 
 let running = false;
 
@@ -12,10 +13,56 @@ let running = false;
  * a reminder automatically wins as the new anchor, so every old projected time
  * is effectively cancelled without needing to delete scheduled jobs.
  */
-export function nextReminderTimestamp(device) {
+export function effectiveIntervalMinutes(device, now = null) {
+  const base = device.settings.intervalMin;
+  if (!now || !device.settings.adaptiveEnabled) return base;
+  const { date, minutes } = localParts(now, device.settings.tz);
+  if (minutes < 17 * 60) return base;
+
+  const start = parseHM(device.settings.start);
+  const end = parseHM(device.settings.end);
+  const dayProgress = Math.max(0, Math.min(1, (minutes - start) / Math.max(1, end - start)));
+  const waterProgress = totalForDate(device, date) / device.settings.goalMl;
+  let adjusted = base;
+  if (waterProgress < dayProgress - 0.2) adjusted = base * 0.7;
+  else if (waterProgress > dayProgress + 0.15) adjusted = base * 1.35;
+  return Math.max(15, Math.round(adjusted / 5) * 5);
+}
+
+export function nextReminderTimestamp(device, now = null) {
   const reference = Math.max(device.lastSentAt || 0, lastDrinkTimestamp(device));
   if (!reference) return 0; // first-time devices are due as soon as their window opens
-  return reference + device.settings.intervalMin * 60_000;
+  return reference + effectiveIntervalMinutes(device, now) * 60_000;
+}
+
+function isWeekend(date) {
+  const weekday = new Date(`${date}T00:00:00Z`).getUTCDay();
+  return weekday === 0 || weekday === 6;
+}
+
+function isInsideBreak(settings, minutes) {
+  return settings.breakEnabled &&
+    minutes >= parseHM(settings.breakStart) &&
+    minutes < parseHM(settings.breakEnd);
+}
+
+function reminderKind(device, now) {
+  const primaryDueAt = nextReminderTimestamp(device, now);
+  if (primaryDueAt === 0 || now.getTime() >= primaryDueAt - 20_000) return 'primary';
+
+  const lastDrinkAt = lastDrinkTimestamp(device);
+  const followUpDueAt = (device.lastSentAt || 0) + device.settings.followUpMin * 60_000;
+  if (
+    device.settings.followUpEnabled &&
+    device.lastSentAt > 0 &&
+    device.followUpEligibleFor === device.lastSentAt &&
+    lastDrinkAt <= device.lastSentAt &&
+    device.followUpSentFor !== device.lastSentAt &&
+    now.getTime() >= followUpDueAt - 20_000
+  ) {
+    return 'follow-up';
+  }
+  return null;
 }
 
 /**
@@ -34,27 +81,34 @@ export function isDue(device, now) {
   if ((!pushReady && !telegramReady) || !s.enabled) return false;
 
   const { date, minutes } = localParts(now, s.tz);
-  const weekday = new Date(`${date}T00:00:00Z`).getUTCDay();
-  if (s.skipWeekends && (weekday === 0 || weekday === 6)) return false;
+  if (s.skipWeekends && isWeekend(date)) return false;
   if (minutes < parseHM(s.start) || minutes > parseHM(s.end)) return false;
+  if (isInsideBreak(s, minutes)) return false;
 
   const totalMl = totalForDate(device, date);
   if (totalMl >= s.goalMl) return false;
 
-  const dueAt = nextReminderTimestamp(device);
-  return dueAt === 0 || now.getTime() >= dueAt - 20_000; // 20s slack for minute tick jitter
+  return Boolean(reminderKind(device, now));
 }
 
-export function reminderPayload(device, now) {
+export function reminderPayload(device, now, kind = 'primary') {
   const { date, minutes } = localParts(now, device.settings.tz);
   const totalMl = totalForDate(device, date);
   const { title, body } = buildReminder({
     totalMl,
     goalMl: device.settings.goalMl,
     isFirstOfDay: totalMl === 0,
+    isFollowUp: kind === 'follow-up',
+    customMessages: device.settings.customMessages,
     minutes,
   });
-  return { title, body, tag: 'water-reminder', url: '/' };
+  return {
+    title,
+    body,
+    tag: 'water-reminder',
+    url: '/',
+    remainingCups: Math.max(0, Math.ceil((device.settings.goalMl - totalMl) / device.settings.cupSizeMl)),
+  };
 }
 
 /** One scheduler pass. `sender` is injectable so tests don't hit the network. */
@@ -63,9 +117,26 @@ export async function tick(now = new Date(), sender = sendPush, telegramSender =
   running = true;
   try {
     for (const device of allDevices()) {
+      const local = localParts(now, device.settings.tz);
+      const ownerAlertDue =
+        device.settings.telegramNoDrinkAlertEnabled &&
+        local.minutes >= parseHM(device.settings.ownerNoDrinkAlertTime) &&
+        !(device.settings.skipWeekends && isWeekend(local.date));
+      if (ownerAlertDue) {
+        const alert = await maybeSendNoDrinkAlert(
+          device,
+          { date: local.date, totalMl: totalForDate(device, local.date) },
+          telegramSender,
+        );
+        if (alert.error) {
+          console.warn(`[scheduler] owner check-in failed for ${device.id.slice(0, 8)}:`, alert.error?.message);
+        }
+      }
+
       if (!isDue(device, now)) continue;
 
-      const payload = reminderPayload(device, now);
+      const kind = reminderKind(device, now);
+      const payload = reminderPayload(device, now, kind);
       let delivered = false;
 
       if (device.subscription && device.settings.pushEnabled) {
@@ -90,7 +161,13 @@ export async function tick(now = new Date(), sender = sendPush, telegramSender =
         if (!result.ok) console.warn(`[scheduler] Telegram failed for ${device.id.slice(0, 8)}:`, result.error?.message);
       }
 
-      if (delivered) device.lastSentAt = now.getTime();
+      if (delivered && kind === 'follow-up') {
+        device.followUpSentFor = device.lastSentAt;
+      } else if (delivered) {
+        device.lastSentAt = now.getTime();
+        device.followUpEligibleFor = device.lastSentAt;
+        device.followUpSentFor = 0;
+      }
       save();
     }
   } finally {

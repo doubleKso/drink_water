@@ -24,9 +24,17 @@ const NOON = new Date('2026-11-05T05:30:00Z'); // 12:00 in Asia/Yangon (UTC+6:30
 function makeDevice(id, overrides = {}) {
   const device = store.ensureDevice(id);
   device.subscription = { endpoint: 'https://web.push.apple.com/x', keys: { p256dh: 'a', auth: 'b' } };
-  device.settings = { ...store.DEFAULT_SETTINGS, ...overrides };
+  device.settings = {
+    ...store.DEFAULT_SETTINGS,
+    breakEnabled: false,
+    followUpEnabled: false,
+    adaptiveEnabled: false,
+    ...overrides,
+  };
   device.log = {};
   device.lastSentAt = 0;
+  device.followUpSentFor = 0;
+  device.followUpEligibleFor = 0;
   return device;
 }
 
@@ -91,6 +99,58 @@ test('isDue can skip Saturday and Sunday in the device timezone', () => {
   assert.ok(!scheduler.isDue(d, saturdayNoon));
   d.settings.skipWeekends = false;
   assert.ok(scheduler.isDue(d, saturdayNoon));
+});
+
+test('isDue pauses during the configured lunch break', () => {
+  store.__resetForTests();
+  const d = makeDevice('aaaaaaaa-aaaa-aaaa-aaaa-000000000014', {
+    breakEnabled: true,
+    breakStart: '12:00',
+    breakEnd: '13:00',
+  });
+  assert.ok(!scheduler.isDue(d, NOON), '12:00 is inside the break');
+  assert.ok(scheduler.isDue(d, new Date('2026-11-05T06:30:00Z')), '13:00 resumes reminders');
+});
+
+test('one gentle follow-up is sent after 15 minutes and a drink cancels it', async () => {
+  store.__resetForTests();
+  const d = makeDevice('aaaaaaaa-aaaa-aaaa-aaaa-000000000015', {
+    intervalMin: 60,
+    followUpEnabled: true,
+    followUpMin: 15,
+  });
+  const primaryAt = new Date('2026-11-06T03:30:00Z'); // 10:00 local
+  d.lastSentAt = primaryAt.getTime();
+  d.followUpEligibleFor = d.lastSentAt;
+  const sent = [];
+  const sender = async (_subscription, payload) => {
+    sent.push(payload);
+    return { ok: true };
+  };
+
+  await scheduler.tick(new Date('2026-11-06T03:45:00Z'), sender);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].title, /မမေ့/);
+  assert.equal(d.followUpSentFor, primaryAt.getTime());
+  await scheduler.tick(new Date('2026-11-06T03:46:00Z'), sender);
+  assert.equal(sent.length, 1, 'the follow-up is never repeated');
+
+  d.followUpSentFor = 0;
+  store.recordDrink(d, '2026-11-06', 250, new Date('2026-11-06T03:40:00Z').getTime());
+  await scheduler.tick(new Date('2026-11-06T03:45:00Z'), sender);
+  assert.equal(sent.length, 1, 'a drink after the primary cancels its follow-up');
+});
+
+test('adaptive interval tightens when behind and relaxes when ahead in the evening', () => {
+  store.__resetForTests();
+  const d = makeDevice('aaaaaaaa-aaaa-aaaa-aaaa-000000000016', {
+    intervalMin: 60,
+    adaptiveEnabled: true,
+  });
+  const evening = new Date('2026-11-06T12:30:00Z'); // 19:00 local
+  assert.equal(scheduler.effectiveIntervalMinutes(d, evening), 40);
+  d.log['2026-11-06'] = [{ at: evening.getTime() - 60_000, ml: 2000 }];
+  assert.equal(scheduler.effectiveIntervalMinutes(d, evening), 80);
 });
 
 test('a new drink cancels the old rolling schedule and becomes the next anchor', async () => {
@@ -192,6 +252,10 @@ test('state: streak counts consecutive finished days', () => {
   assert.equal(state.streak, 3, 'finishing today extends it');
   assert.equal(state.week.length, 7);
   assert.equal(state.week.at(-1).date, '2026-11-05');
+  assert.equal(state.month.length, 30);
+  assert.equal(state.month.find((day) => day.date === '2026-11-05').done, true);
+  assert.equal(state.weekSummary.completedDays, 3);
+  assert.equal(state.todayLog.length, 2);
 });
 
 test('undoDrink removes only the latest entry', () => {
@@ -203,6 +267,16 @@ test('undoDrink removes only the latest entry', () => {
   assert.deepEqual(d.log['2026-11-05'], [{ at: 1, ml: 250 }]);
   assert.ok(store.undoDrink(d, '2026-11-05'));
   assert.ok(!store.undoDrink(d, '2026-11-05'));
+});
+
+test('backdated drinks reset the rolling clock and offline event IDs are idempotent', () => {
+  store.__resetForTests();
+  const d = makeDevice('aaaaaaaa-aaaa-aaaa-aaaa-000000000017', { intervalMin: 60 });
+  const at1030 = new Date('2026-11-06T04:00:00Z').getTime();
+  assert.ok(store.recordDrink(d, '2026-11-06', 500, at1030, 'offline-event-0001'));
+  assert.ok(!store.recordDrink(d, '2026-11-06', 500, at1030, 'offline-event-0001'));
+  assert.equal(stats.totalForDate(d, '2026-11-06'), 500, 'a retry never double counts');
+  assert.equal(scheduler.nextReminderTimestamp(d), at1030 + 60 * 60_000);
 });
 
 test('reminder text includes progress and adapts near the goal', () => {
@@ -300,6 +374,27 @@ test('goal completion alerts the owner once per local date', async () => {
   assert.match(sent[0].text, /ဒီနေ့ ရေပန်းတိုင် ပြည့်ပြီ/);
 });
 
+test('consent-based no-drink owner check-in sends once in the evening', async () => {
+  store.__resetForTests();
+  const d = makeDevice('aaaaaaaa-aaaa-aaaa-aaaa-000000000018', {
+    telegramNoDrinkAlertEnabled: true,
+    ownerNoDrinkAlertTime: '18:00',
+  });
+  d.subscription = null;
+  d.telegram.owner = { chatId: '999', name: 'Owner' };
+  const sent = [];
+  const telegramSender = async (chatId, text) => {
+    sent.push({ chatId, text });
+    return { ok: true };
+  };
+  const evening = new Date('2026-11-06T11:30:00Z'); // 18:00 local
+  await scheduler.tick(evening, async () => ({ ok: true }), telegramSender);
+  await scheduler.tick(new Date(evening.getTime() + 60_000), async () => ({ ok: true }), telegramSender);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].chatId, '999');
+  assert.match(sent[0].text, /မမှတ်ရသေး/);
+});
+
 test('legacy cup logs migrate to ml without losing history', () => {
   const id = 'aaaaaaaa-aaaa-aaaa-aaaa-000000000009';
   store.__resetForTests({
@@ -339,5 +434,5 @@ test('settings migration never overwrites a custom reminder schedule', () => {
   assert.equal(d.settings.start, '07:15');
   assert.equal(d.settings.end, '21:30');
   assert.equal(d.settings.intervalMin, 45);
-  assert.equal(d.settings.version, 2);
+  assert.equal(d.settings.version, 3);
 });
