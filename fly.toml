@@ -1,9 +1,9 @@
-# fly.toml app configuration file generated for drink-water on 2026-11-05T13:12:58Z
+# fly.toml app configuration file generated for drink-water-9wir8q on 2026-11-06T06:59:15Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'drink-water'
+app = 'drink-water-9wir8q'
 primary_region = 'sin'
 
 [build]
