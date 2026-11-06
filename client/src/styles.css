@@ -821,11 +821,28 @@ h3 {
   position: sticky;
   bottom: calc(-24px - env(safe-area-inset-bottom));
   display: grid;
-  grid-template-columns: 1fr 1.4fr;
+  grid-template-columns: minmax(0, 1fr) 1fr;
   gap: 10px;
   background: linear-gradient(transparent, var(--card) 18%);
   padding: 24px 0 calc(24px + env(safe-area-inset-bottom));
   margin-bottom: calc(-24px - env(safe-area-inset-bottom));
+}
+
+.save-status {
+  align-self: center;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+  padding-left: 4px;
+}
+
+.save-status.saved {
+  color: var(--good);
+}
+
+.save-status.error,
+.save-status.invalid {
+  color: var(--danger);
 }
 
 .stepper {

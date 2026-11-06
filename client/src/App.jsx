@@ -138,14 +138,12 @@ export default function App() {
 
   const onUndo = () => run(async () => setState(await api.undo()), 'ပြန်ဖျက်လို့မရဘူး');
 
-  const onSaveSettings = (form) =>
-    run(async () => {
-      const next = await api.saveSettings(form);
-      setState(next);
-      setSelectedMl(next.settings.cupSizeMl);
-      setShowSettings(false);
-      say('သိမ်းပြီးပါပြီ ✅');
-    }, 'သိမ်းလို့မရဘူး');
+  const onSaveSettings = useCallback(async (form) => {
+    const next = await api.saveSettings(form);
+    setState(next);
+    setSelectedMl(next.settings.cupSizeMl);
+    return next;
+  }, []);
 
   // NOTE: this must stay a direct tap handler. enablePush() asks for permission before any await.
   const onEnable = () =>

@@ -8,6 +8,17 @@ import { sendTelegram, telegramConfigured } from './telegram.js';
 let running = false;
 
 /**
+ * Reminders use a rolling anchor, not a pre-created queue. A drink recorded after
+ * a reminder automatically wins as the new anchor, so every old projected time
+ * is effectively cancelled without needing to delete scheduled jobs.
+ */
+export function nextReminderTimestamp(device) {
+  const reference = Math.max(device.lastSentAt || 0, lastDrinkTimestamp(device));
+  if (!reference) return 0; // first-time devices are due as soon as their window opens
+  return reference + device.settings.intervalMin * 60_000;
+}
+
+/**
  * Decides whether a device is due a reminder right now.
  * Rules:
  *  - only while the device has push + reminders enabled
@@ -30,18 +41,18 @@ export function isDue(device, now) {
   const totalMl = totalForDate(device, date);
   if (totalMl >= s.goalMl) return false;
 
-  const reference = Math.max(device.lastSentAt || 0, lastDrinkTimestamp(device));
-  const waitedMs = now.getTime() - reference;
-  return waitedMs >= s.intervalMin * 60_000 - 20_000; // 20s slack for tick jitter
+  const dueAt = nextReminderTimestamp(device);
+  return dueAt === 0 || now.getTime() >= dueAt - 20_000; // 20s slack for minute tick jitter
 }
 
 export function reminderPayload(device, now) {
-  const { date } = localParts(now, device.settings.tz);
+  const { date, minutes } = localParts(now, device.settings.tz);
   const totalMl = totalForDate(device, date);
   const { title, body } = buildReminder({
     totalMl,
     goalMl: device.settings.goalMl,
     isFirstOfDay: totalMl === 0,
+    minutes,
   });
   return { title, body, tag: 'water-reminder', url: '/' };
 }

@@ -50,17 +50,21 @@ test('time validators', () => {
 test('isDue follows the window, goal and interval rules', () => {
   store.__resetForTests();
   const d = makeDevice('aaaaaaaa-aaaa-aaaa-aaaa-000000000001');
+  assert.deepEqual(
+    { start: d.settings.start, end: d.settings.end, intervalMin: d.settings.intervalMin },
+    { start: '06:00', end: '22:00', intervalMin: 30 },
+  );
   assert.ok(scheduler.isDue(d, NOON), 'due at noon with no history');
 
-  const early = new Date('2026-11-05T02:00:00Z'); // 08:30 local, before 09:00
+  const early = new Date('2026-11-04T23:00:00Z'); // 05:30 local, before 06:00
   assert.ok(!scheduler.isDue(d, early), 'not before the window opens');
 
-  const night = new Date('2026-11-05T12:00:00Z'); // 18:30 local, after 17:30
+  const night = new Date('2026-11-05T16:00:00Z'); // 22:30 local, after 22:00
   assert.ok(!scheduler.isDue(d, night), 'not after the window closes');
 
-  d.lastSentAt = NOON.getTime() - 30 * 60_000;
-  assert.ok(!scheduler.isDue(d, NOON), 'not when the last reminder was 30 min ago');
-  d.lastSentAt = NOON.getTime() - 61 * 60_000;
+  d.lastSentAt = NOON.getTime() - 15 * 60_000;
+  assert.ok(!scheduler.isDue(d, NOON), 'not when the last reminder was 15 min ago');
+  d.lastSentAt = NOON.getTime() - 31 * 60_000;
   assert.ok(scheduler.isDue(d, NOON), 'due again after the interval');
 
   // drinking on her own resets the clock
@@ -87,6 +91,63 @@ test('isDue can skip Saturday and Sunday in the device timezone', () => {
   assert.ok(!scheduler.isDue(d, saturdayNoon));
   d.settings.skipWeekends = false;
   assert.ok(scheduler.isDue(d, saturdayNoon));
+});
+
+test('a new drink cancels the old rolling schedule and becomes the next anchor', async () => {
+  store.__resetForTests();
+  const d = makeDevice('aaaaaaaa-aaaa-aaaa-aaaa-000000000012', {
+    intervalMin: 60,
+    skipWeekends: false,
+  });
+  const at0900 = new Date('2026-11-06T02:30:00Z');
+  const at0959 = new Date('2026-11-06T03:29:00Z');
+  const at1000 = new Date('2026-11-06T03:30:00Z');
+  const at1030 = new Date('2026-11-06T04:00:00Z');
+  const at1100 = new Date('2026-11-06T04:30:00Z');
+  const at1130 = new Date('2026-11-06T05:00:00Z');
+
+  store.recordDrink(d, '2026-11-06', 250, at0900.getTime());
+  assert.equal(scheduler.nextReminderTimestamp(d), at1000.getTime());
+  assert.ok(!scheduler.isDue(d, at0959));
+  assert.ok(scheduler.isDue(d, at1000));
+
+  await scheduler.tick(at1000, async () => ({ ok: true }));
+  assert.equal(d.lastSentAt, at1000.getTime());
+  assert.equal(scheduler.nextReminderTimestamp(d), at1100.getTime());
+
+  store.recordDrink(d, '2026-11-06', 250, at1030.getTime());
+  assert.equal(scheduler.nextReminderTimestamp(d), at1130.getTime());
+  assert.ok(!scheduler.isDue(d, at1100), 'the old 11:00 reminder is cancelled');
+  assert.ok(scheduler.isDue(d, at1130), 'the replacement reminder is due at 11:30');
+});
+
+test('hourly reminders keep rolling from a 09:30 drink', async () => {
+  store.__resetForTests();
+  const d = makeDevice('aaaaaaaa-aaaa-aaaa-aaaa-000000000013', {
+    intervalMin: 60,
+    skipWeekends: false,
+  });
+  const drinkAt = new Date('2026-11-06T03:00:00Z'); // 09:30 local
+  store.recordDrink(d, '2026-11-06', 250, drinkAt.getTime());
+
+  const expectedLocalHours = ['10:30', '11:30', '12:30', '13:30', '14:30'];
+  const expectedTimes = [
+    '2026-11-06T04:00:00Z',
+    '2026-11-06T05:00:00Z',
+    '2026-11-06T06:00:00Z',
+    '2026-11-06T07:00:00Z',
+    '2026-11-06T08:00:00Z',
+  ].map((value) => new Date(value));
+  const sentAt = [];
+  for (let i = 0; i < expectedTimes.length; i++) {
+    const time = expectedTimes[i];
+    assert.equal(scheduler.nextReminderTimestamp(d), time.getTime(), `next reminder is ${expectedLocalHours[i]}`);
+    await scheduler.tick(time, async () => {
+      sentAt.push(expectedLocalHours[i]);
+      return { ok: true };
+    });
+  }
+  assert.deepEqual(sentAt, expectedLocalHours);
 });
 
 test('tick sends once, respects the interval, and drops dead subscriptions', async () => {
@@ -145,8 +206,22 @@ test('undoDrink removes only the latest entry', () => {
 });
 
 test('reminder text includes progress and adapts near the goal', () => {
-  const first = messages.buildReminder({ totalMl: 0, goalMl: 2000, isFirstOfDay: true, random: () => 0 });
+  const first = messages.buildReminder({
+    totalMl: 0,
+    goalMl: 2000,
+    isFirstOfDay: true,
+    minutes: 6 * 60,
+    random: () => 0,
+  });
   assert.match(first.body, /0\/2,000 ml/);
+  assert.match(first.body, /မင်္ဂလာနံနက်ခင်း/);
+  const evening = messages.buildReminder({
+    totalMl: 500,
+    goalMl: 2000,
+    minutes: 19 * 60,
+    random: () => 0,
+  });
+  assert.match(evening.body, /ညနေပိုင်း/);
   const last = messages.buildReminder({ totalMl: 1750, goalMl: 2000, random: () => 0 });
   assert.match(last.body, /1,750\/2,000 ml/);
 });
@@ -240,6 +315,29 @@ test('legacy cup logs migrate to ml without losing history', () => {
   });
   const d = store.ensureDevice(id);
   assert.equal(d.settings.goalMl, 2000);
+  assert.equal(d.settings.start, '06:00');
+  assert.equal(d.settings.end, '22:00');
+  assert.equal(d.settings.intervalMin, 30);
   assert.deepEqual(d.log['2026-11-05'], [{ at: 1, ml: 250 }, { at: 2, ml: 250 }]);
   assert.equal(stats.buildState(d, NOON).totalMl, 500);
+});
+
+test('settings migration never overwrites a custom reminder schedule', () => {
+  const id = 'aaaaaaaa-aaaa-aaaa-aaaa-000000000010';
+  store.__resetForTests({
+    devices: {
+      [id]: {
+        id,
+        settings: { enabled: true, start: '07:15', end: '21:30', intervalMin: 45, tz: 'Asia/Yangon' },
+        subscription: null,
+        lastSentAt: 0,
+        log: {},
+      },
+    },
+  });
+  const d = store.ensureDevice(id);
+  assert.equal(d.settings.start, '07:15');
+  assert.equal(d.settings.end, '21:30');
+  assert.equal(d.settings.intervalMin, 45);
+  assert.equal(d.settings.version, 2);
 });

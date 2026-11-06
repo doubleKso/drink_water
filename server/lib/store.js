@@ -21,13 +21,15 @@ export const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data')
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const MAX_DEVICES = Number(process.env.MAX_DEVICES || 50);
 const KEEP_DAYS = 90;
+const SETTINGS_VERSION = 2;
 
 export const DEFAULT_SETTINGS = Object.freeze({
+  version: SETTINGS_VERSION,
   enabled: true,
   pushEnabled: true,
-  start: '09:00',
-  end: '17:30',
-  intervalMin: 60,
+  start: '06:00',
+  end: '22:00',
+  intervalMin: 30,
   goalMl: 2000,
   cupSizeMl: 250,
   skipWeekends: true,
@@ -48,7 +50,27 @@ if (!db.devices || typeof db.devices !== 'object') db.devices = {};
 
 function normalizeDevice(device) {
   let changed = false;
-  const current = device.settings && typeof device.settings === 'object' ? device.settings : {};
+  let current = device.settings && typeof device.settings === 'object' ? device.settings : {};
+  // Move devices that still use the untouched original schedule to the new default.
+  // Any custom schedule is preserved exactly as the user chose it.
+  if (
+    (!Number.isInteger(current.version) || current.version < SETTINGS_VERSION) &&
+    current.start === '09:00' &&
+    current.end === '17:30' &&
+    Number(current.intervalMin) === 60
+  ) {
+    current = {
+      ...current,
+      start: DEFAULT_SETTINGS.start,
+      end: DEFAULT_SETTINGS.end,
+      intervalMin: DEFAULT_SETTINGS.intervalMin,
+    };
+    changed = true;
+  }
+  if (current.version !== SETTINGS_VERSION) {
+    current = { ...current, version: SETTINGS_VERSION };
+    changed = true;
+  }
   const legacyGoal = Number(current.goal);
   const cupSizeMl = Number.isInteger(current.cupSizeMl) ? current.cupSizeMl : DEFAULT_SETTINGS.cupSizeMl;
   const goalMl = Number.isInteger(current.goalMl)

@@ -1,9 +1,14 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { formatInterval } from './NotifyCard.jsx';
 
 const INTERVALS = [30, 45, 60, 90, 120];
 const GOALS = [1500, 2000, 2500, 3000, 3500, 4000];
 const CUP_SIZES = [150, 250, 350, 500];
+const HM = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+function validTimes(value) {
+  return HM.test(value.start) && HM.test(value.end) && value.start < value.end;
+}
 
 function TelegramConnection({
   role,
@@ -56,19 +61,116 @@ export default function SettingsSheet({
   onTestTelegram,
 }) {
   const [form, setForm] = useState({ ...settings });
-  const set = (patch) => setForm((current) => ({ ...current, ...patch }));
-  const timesOk = form.start < form.end;
+  const [saveStatus, setSaveStatus] = useState('idle');
+  const [closing, setClosing] = useState(false);
+  const latestForm = useRef(form);
+  const saveTimer = useRef(null);
+  const saveQueue = useRef(Promise.resolve());
+  const revision = useRef(0);
+  const queuedRevision = useRef(0);
+  const savedRevision = useRef(0);
+  const mounted = useRef(true);
+  const timesOk = validTimes(form);
   const goalOptions = Array.from(new Set([...GOALS, form.goalMl])).sort((a, b) => a - b);
   const cupOptions = Array.from(new Set([...CUP_SIZES, form.cupSizeMl])).sort((a, b) => a - b);
 
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      clearTimeout(saveTimer.current);
+    };
+  }, []);
+
+  const persist = useCallback((snapshot, targetRevision) => {
+    clearTimeout(saveTimer.current);
+    if (targetRevision <= queuedRevision.current) return saveQueue.current;
+    queuedRevision.current = targetRevision;
+    if (mounted.current) setSaveStatus('saving');
+
+    const request = saveQueue.current
+      .catch(() => undefined)
+      .then(() => onSave(snapshot));
+    saveQueue.current = request;
+    request.then(
+      () => {
+        savedRevision.current = Math.max(savedRevision.current, targetRevision);
+        if (mounted.current && targetRevision === revision.current) setSaveStatus('saved');
+      },
+      () => {
+        if (queuedRevision.current === targetRevision) queuedRevision.current = targetRevision - 1;
+        if (mounted.current && targetRevision === revision.current) setSaveStatus('error');
+      },
+    );
+    return request;
+  }, [onSave]);
+
+  const scheduleSave = useCallback((next) => {
+    const nextRevision = ++revision.current;
+    clearTimeout(saveTimer.current);
+    if (!validTimes(next)) {
+      setSaveStatus('invalid');
+      return;
+    }
+    setSaveStatus('pending');
+    saveTimer.current = setTimeout(() => persist(next, nextRevision), 350);
+  }, [persist]);
+
+  const set = useCallback((patch) => {
+    const next = { ...latestForm.current, ...patch };
+    latestForm.current = next;
+    setForm(next);
+    scheduleSave(next);
+  }, [scheduleSave]);
+
+  const flushSave = useCallback(async () => {
+    clearTimeout(saveTimer.current);
+    const targetRevision = revision.current;
+    if (!validTimes(latestForm.current)) throw new Error('invalid time range');
+    if (savedRevision.current >= targetRevision) return;
+    await persist(latestForm.current, targetRevision);
+  }, [persist]);
+
+  const requestClose = useCallback(async () => {
+    if (closing || !validTimes(latestForm.current)) return;
+    setClosing(true);
+    try {
+      await flushSave();
+      onClose();
+    } catch {
+      if (mounted.current) {
+        setSaveStatus('error');
+        setClosing(false);
+      }
+    }
+  }, [closing, flushSave, onClose]);
+
+  const afterSave = useCallback(async (action, role) => {
+    try {
+      await flushSave();
+      await action(role);
+    } catch {
+      if (mounted.current) setSaveStatus('error');
+    }
+  }, [flushSave]);
+
+  const statusText = {
+    idle: 'ပြောင်းလိုက်တာနဲ့ အလိုအလျောက်သိမ်းမယ်',
+    pending: 'ခဏနေရင် အလိုအလျောက်သိမ်းမယ်…',
+    saving: 'သိမ်းနေပါတယ်…',
+    saved: 'သိမ်းပြီးပါပြီ ✓',
+    invalid: 'အချိန်ကို မှန်အောင် ပြင်ပေးပါ',
+    error: 'မသိမ်းနိုင်သေးပါ—အင်တာနက် စစ်ပါ',
+  }[saveStatus];
+
   return (
-    <div className="overlay" role="dialog" aria-modal="true" aria-label="ချိန်ညှိမယ်" onClick={onClose}>
+    <div className="overlay" role="dialog" aria-modal="true" aria-label="ချိန်ညှိမယ်" onClick={requestClose}>
       <form
         className="sheet"
         onClick={(event) => event.stopPropagation()}
         onSubmit={(event) => {
           event.preventDefault();
-          if (timesOk) onSave(form);
+          requestClose();
         }}
       >
         <div className="sheet-handle" />
@@ -77,7 +179,7 @@ export default function SettingsSheet({
             <span className="eyebrow">PREFERENCES</span>
             <h2>ချိန်ညှိမယ်</h2>
           </div>
-          <button type="button" className="close-btn" onClick={onClose} aria-label="ပိတ်မယ်">×</button>
+          <button type="button" className="close-btn" onClick={requestClose} aria-label="ပိတ်မယ်">×</button>
         </div>
 
         <section className="settings-section">
@@ -166,9 +268,9 @@ export default function SettingsSheet({
             connection={telegram.reminder}
             configured={telegram.configured}
             saving={saving}
-            onLink={onLinkTelegram}
-            onDisconnect={onDisconnectTelegram}
-            onTest={onTestTelegram}
+            onLink={(role) => afterSave(onLinkTelegram, role)}
+            onDisconnect={(role) => afterSave(onDisconnectTelegram, role)}
+            onTest={(role) => afterSave(onTestTelegram, role)}
           />
           <label className="setting-line nested">
             <span><b>Telegram backup ပို့မယ်</b></span>
@@ -190,9 +292,9 @@ export default function SettingsSheet({
             connection={telegram.owner}
             configured={telegram.configured}
             saving={saving}
-            onLink={onLinkTelegram}
-            onDisconnect={onDisconnectTelegram}
-            onTest={onTestTelegram}
+            onLink={(role) => afterSave(onLinkTelegram, role)}
+            onDisconnect={(role) => afterSave(onDisconnectTelegram, role)}
+            onTest={(role) => afterSave(onTestTelegram, role)}
           />
           <label className="setting-line nested">
             <span><b>ပြည့်တာနဲ့ အသိပေးမယ်</b></span>
@@ -209,9 +311,9 @@ export default function SettingsSheet({
         </section>
 
         <div className="sheet-actions">
-          <button type="button" className="btn ghost" onClick={onClose}>မလုပ်တော့ဘူး</button>
-          <button type="submit" className="btn primary" disabled={saving || !timesOk}>
-            {saving ? 'သိမ်းနေပါတယ်…' : 'သိမ်းမယ်'}
+          <div className={`save-status ${saveStatus}`} role="status">{statusText}</div>
+          <button type="submit" className="btn primary" disabled={saving || closing || !timesOk}>
+            {closing ? 'ခဏလေး…' : 'ပြီးပါပြီ'}
           </button>
         </div>
       </form>
